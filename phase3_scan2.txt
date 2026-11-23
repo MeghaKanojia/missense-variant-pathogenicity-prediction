@@ -1,0 +1,326 @@
+--- CELL 0 markdown ---
+# Phase 3: Graph Construction — From Structures to PAE-Weighted Protein Graphs
+This notebook turns each protein's AlphaFold structure into a graph the GNN can learn from, and attaches each ClinVar variant as a labelled training sample on that graph.
+
+**In one sentence:** each protein becomes a network where every amino acid is a node, two amino acids are connected if they sit close together in the folded 3D structure, and each connection is weighted by how *confident* AlphaFold is about that pair's relative position (the PAE-weighting that is this project's core novel idea).
+
+**Inputs:** `clinvar_with_structures.csv`, `alphafold_data/pdb/*.pdb`, `alphafold_data/pae/*.json`, `alphafold_data/metadata/*.json` (all from Phase 2)
+
+**Outputs:**
+- `esm2_embeddings/{UniProt_ID}.npy` — per-protein evolutionary embeddings (one row per residue)
+- `protein_graphs/{UniProt_ID}.pt` — one cached structural graph per protein (shared by all its variants)
+- `phase3_graph_manifest.csv` — per-protein status log for this phase
+- `clinvar_graph_ready.csv` — final variant table, restricted to variants whose protein graph built successfully
+- A `MissenseVariantGraphDataset` class (PyTorch Geometric `Dataset`) that turns each row of that table into a labelled training graph on demand — this is the object Phase 4 (model training) will load directly.
+
+**Key sources:**
+- Jumper, J. et al. (2021). *Highly accurate protein structure prediction with AlphaFold.* Nature, 596, 583–589. [doi:10.1038/s41586-021-03819-2](https://doi.org/10.1038/s41586-021-03819-2) — defines the Predicted Aligned Error (PAE) we use as edge weights.
+- Lin, Z. et al. (2023). *Evolutionary-scale prediction of atomic-level protein structure with a language model.* Science, 379(6637), 1123–1130. [doi:10.1126/science.ade2574](https://doi.org/10.1126/science.ade2574) — the ESM-2 protein language model used for node features.
+- Gligorijević, V. et al. (2021). *Structure-based protein function prediction using graph convolutional networks.* Nature Communications, 12, 3168. [doi:10.1038/s41467-021-23303-9](https://doi.org/10.1038/s41467-021-23303-9) — representative use of a Cα distance cutoff to define a residue contact graph, the convention we follow for edges.
+- Fey, M. & Lenssen, J.E. (2019). *Fast Graph Representation Learning with PyTorch Geometric.* ICLR Workshop on Representation Learning on Graphs and Manifolds. [arXiv:1903.02428](https://arxiv.org/abs/1903.02428) — the graph deep learning library we build on.
+
+--- CELL 2 markdown ---
+## 1. Load Phase 2 Output
+We work from `clinvar_with_structures.csv` — every variant here already has a confirmed AlphaFold structure and PAE matrix (Phase 2), and has passed two independent reference-amino-acid checks (Phase 1 + Phase 2). Phase 3 adds a *third* layer of validation specific to graph-building, in Section 4, because it works directly off the raw structure/PAE files rather than their summary metadata.
+
+--- CELL 3 code ---
+df = pd.read_csv("clinvar_with_structures.csv")
+print(f"Variants carried into Phase 3 : {len(df):,}")
+print(f"Unique proteins                : {df['UniProt_ID'].nunique():,}")
+print(f"  Pathogenic (1): {(df['Target']==1).sum():,}")
+print(f"  Benign     (0): {(df['Target']==0).sum():,}")
+
+BASE_DIR = "alphafold_data"
+PDB_DIR = os.path.join(BASE_DIR, "pdb")
+PAE_DIR = os.path.join(BASE_DIR, "pae")
+META_DIR = os.path.join(BASE_DIR, "metadata")
+
+ESM2_DIR = "esm2_embeddings"
+GRAPH_DIR = "protein_graphs"
+os.makedirs(ESM2_DIR, exist_ok=True)
+os.makedirs(GRAPH_DIR, exist_ok=True)
+
+unique_proteins = sorted(df["UniProt_ID"].unique().tolist())
+
+--- CELL 9 markdown ---
+## 4. Node Features, Part 2 & Edges: The Structural Contact Graph
+### Turning a 3D structure into a graph
+We treat each amino acid (residue) as a **node**. Two nodes get an **edge** between them if their Cα atoms — the central 'backbone' atom of each amino acid, standard for representing residue position — are within **8 Å** of each other in the folded 3D structure. This distance-cutoff contact graph is a widely used convention for representing protein structure as a graph for deep learning (e.g. Gligorijević et al., 2021, [doi:10.1038/s41467-021-23303-9](https://doi.org/10.1038/s41467-021-23303-9)). Intuitively: two amino acids that are close together in the folded protein can physically interact (e.g. forming part of the same binding pocket or structural core) even if they are far apart in the linear sequence — this is exactly the information a graph adds beyond a flat sequence.
+
+### Why weight edges by PAE — the project's central novel idea
+A binary 'are they within 8Å, yes or no' edge treats AlphaFold's prediction as ground truth with uniform confidence everywhere. In reality, AlphaFold reports, for every *pair* of residues, a **Predicted Aligned Error (PAE)** — its own estimate (in Ångströms) of how wrong the relative position of that pair might be (Jumper et al., 2021). A low PAE means 'I am confident these two residues are positioned correctly relative to each other'; a high PAE means 'treat this pair's relative position with caution — often this happens between separate domains that move relative to one another, or in flexible linker regions'.
+
+Existing structure-based variant-effect GNNs (e.g. gMVP) use unweighted contact graphs — every edge counts equally. We instead convert each pair's PAE into an edge weight:
+
+```
+edge_weight = 1 / (1 + average(PAE[i][j], PAE[j][i]))
+```
+
+PAE is averaged across both directions because AlphaFold's PAE matrix is not symmetric (the error estimate from residue i's frame looking at j is not identical to j looking at i). The `1/(1+x)` transform maps PAE (0 Å = 'perfectly confident' upward, unbounded) onto a bounded (0, 1] weight where 1 = maximum confidence and the weight shrinks smoothly as uncertainty grows. This lets the GNN learn to down-weight messages passed along structurally uncertain connections, rather than trusting every contact in the structure equally — this PAE-weighting is what distinguishes our approach from a standard contact-graph GNN.
+
+### Per-protein validation before building any graph
+Before con
+
+--- CELL 10 code ---
+DISTANCE_CUTOFF_ANGSTROM = 8.0
+AA_3TO1 = {
+    'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C','GLN':'Q','GLU':'E','GLY':'G','HIS':'H','ILE':'I',
+    'LEU':'L','LYS':'K','MET':'M','PHE':'F','PRO':'P','SER':'S','THR':'T','TRP':'W','TYR':'Y','VAL':'V'
+}
+AA_1TO_ONEHOT_IDX = {aa: i for i, aa in enumerate(sorted(AA_3TO1.values()))}
+N_AA = len(AA_1TO_ONEHOT_IDX)  # 20
+
+pdb_parser = PDBParser(QUIET=True)
+
+def extract_ca_coords_and_sequence(uniprot_id):
+    """Returns (ca_coords: dict[resnum -> xyz], seq_from_pdb: str) ordered by residue number."""
+    pdb_path = os.path.join(PDB_DIR, f"{uniprot_id}.pdb")
+    structure = pdb_parser.get_structure(uniprot_id, pdb_path)
+    ca_coords = {}
+    resnames = {}
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                if residue.get_id()[0] != ' ':
+                    continue  # skip heteroatoms/waters
+                ca_atoms = [a for a in residue if a.get_id() == 'CA']
+                if ca_atoms:
+                    resnum = residue.get_id()[1]
+                    ca_coords[resnum] = ca_atoms[0].get_coord()
+                    resnames[resnum] = AA_3TO1.get(residue.get_resname(), 'X')
+        break  # single-chain monomer models
+    return ca_coords, resnames
+
+--- CELL 11 code ---
+def build_protein_graph(uniprot_id):
+    """
+    Builds and caches one structural graph for a protein.
+    Returns status string: 'cached', 'success', or a specific failure reason.
+    """
+    graph_path = os.path.join(GRAPH_DIR, f"{uniprot_id}.pt")
+    if os.path.exists(graph_path):
+        return "cached"
+
+    if esm2_status.get(uniprot_id) not in ("cached", "success"):
+        return "no_esm2_embedding"
+
+    pae_path = os.path.join(PAE_DIR, f"{uniprot_id}.json")
+    meta_path = os.path.join(META_DIR, f"{uniprot_id}.json")
+    pdb_path = os.path.join(PDB_DIR, f"{uniprot_id}.pdb")
+    if not (os.path.exists(pae_path) and os.path.exists(meta_path) and os.path.exists(pdb_path)):
+        return "missing_input_file"
+
+    with open(meta_path, "r") as f:
+        canonical_seq = json.load(f)["uniprotSequence"]
+    with open(pae_path, "r") as f:
+        pae_matrix = np.array(json.load(f)[0]["predicted_aligned_error"], dtype=np.float32)
+
+    ca_coords, resnames_from_pdb = extract_ca_coords_and_sequence(uniprot_id)
+    esm2_emb = np.load(os.path.join(ESM2_DIR, f"{uniprot_id}.npy"))
+
+    # --- 4-way consistency check: PDB residues == canonical sequence == PAE matrix == ESM-2 embedding ---
+    n_pdb = len(ca_coords)
+    n_seq = len(canonical_seq)
+    n_pae = pae_matrix.shape[0]
+    n_esm = esm2_emb.shape[0]
+    if not (n_pdb == n_seq == n_pae == n_esm):
+        return f"length_mismatch (pdb={n_pdb}, seq={n_seq}, pae={n_pae}, esm2={n_esm})"
+    if set(ca_coords.keys()) != set(range(1, n_pdb + 1)):
+        return "non_contiguous_residue_numbering"
+
+    # --- Build edges: Cα-Cα distance < cutoff ---
+    coords = np.stack([ca_coords[i] for i in range(1, n_pdb + 1)])  # shape (N, 3), ordered by residue number
+    diff = coords[:, None, :] - coords[None, :, :]
+    dist_matrix = np.sqrt((diff ** 2).sum(-1))
+    np.fill_diagonal(dist_matrix, np.inf)  # no self-loops
+    contact_mask = dist_matrix < DISTANCE_CUTOFF_ANGSTROM
+    src, dst = np.where(contact_mask)
+
+    distances = dist_matrix[src, dst]
+    pae_sym = (pae_matrix[src, dst] + pae_matrix[dst, src]) / 2.0
+    pae_weight = 1.0 / (1.0 + pae_sym)
+
+    edge_index = torch.tensor(np.stack([src, dst]), dtype=torch.long)
+    edge_attr = torch.tensor(np.stack([distances, pae_weight], axis=1), dtype=torch.float)  # [distance, pae_weight]
+
+    # --- Node features: ESM-2 embedding (1280) + wild-type AA one-hot (20) + 21 zero placeholder columns ---
+    # The 21 placeholder columns (1 variant-flag + 20 alt-AA one-hot) are filled 
+
+--- CELL 15 code ---
+class MissenseVariantGraphDataset(Dataset):
+    """
+    Each item is one ClinVar missense variant, represented as the shared structural graph for its protein
+    with two node-level edits applied at the variant's position: a variant-site flag and the substituted
+    (Alt_AA) one-hot identity. Label (y) is the ClinVar pathogenicity Target (1 = pathogenic, 0 = benign).
+    """
+
+    def __init__(self, variant_df, graph_dir, cache_size=64):
+        super().__init__()
+        self.variant_df = variant_df.reset_index(drop=True)
+        self.graph_dir = graph_dir
+        self.cache_size = cache_size
+        # Bounded LRU cache, not an unbounded dict: across our ~6,600 proteins, node features alone would
+        # total ~25 GB if every distinct protein touched in one pass were cached simultaneously (mean protein
+        # length 715 residues x 1321 features x 4 bytes x 6,604 proteins) - far more than typical machine RAM.
+        # Keeping only the most-recently-used `cache_size` proteins in memory bounds this to a few hundred MB.
+        self._graph_cache = OrderedDict()
+
+    def len(self):
+        return len(self.variant_df)
+
+    def _load_base_graph(self, uniprot_id):
+        if uniprot_id in self._graph_cache:
+            self._graph_cache.move_to_end(uniprot_id)
+            return self._graph_cache[uniprot_id]
+        graph = torch.load(os.path.join(self.graph_dir, f"{uniprot_id}.pt"), weights_only=False)
+        self._graph_cache[uniprot_id] = graph
+        if len(self._graph_cache) > self.cache_size:
+            self._graph_cache.popitem(last=False)  # evict least-recently-used
+        return graph
+
+    def get(self, idx):
+        row = self.variant_df.iloc[idx]
+        base_graph = self._load_base_graph(row["UniProt_ID"])
+
+        x = base_graph.x.clone()
+        node_idx = int(row["Pos"]) - 1  # PDB/UniProt positions are 1-indexed; tensor rows are 0-indexed
+
+        VARIANT_FLAG_COL = ESM2_EMBEDDING_DIM + N_AA          # column 1300
+        ALT_AA_START_COL = VARIANT_FLAG_COL + 1                # columns 1301..1320
+
+        x[node_idx, VARIANT_FLAG_COL] = 1.0
+        alt_idx = AA_1TO_ONEHOT_IDX[row["Alt_AA_1"]]
+        x[node_idx, ALT_AA_START_COL + alt_idx] = 1.0
+
+        return Data(
+            x=x,
+            edge_index=base_graph.edge_index,
+            edge_attr=base_graph.edge_attr,
+            y=torch.tensor([row["Target"]], dtype=torch.long),
+            uniprot_id=row["UniProt_ID"],
+            variation_id=row["VariationID"],
+            varian
+
+--- CELL 22 markdown ---
+## 9. Visual Sanity Check: Contact Map vs. PAE-Weight Map
+A quick visual cross-check on the same example protein used in Phase 2 (BRCA1, `P38398`): the binary contact map (which residue pairs are within 8 Å) next to the PAE-derived confidence weight for those same pairs. We expect the PAE weights to be high (bright) along the diagonal and in clearly folded local neighbourhoods, and lower in between distant domains — this is a useful figure for the methodology section, showing concretely what the 'PAE-weighted' part of the architecture is operating on.
+
+--- CELL 23 code ---
+import matplotlib.pyplot as plt
+
+example_id = "P38398"
+g = torch.load(os.path.join(GRAPH_DIR, f"{example_id}.pt"), weights_only=False)
+n = g.num_residues
+src, dst = g.edge_index.numpy()
+weights = g.edge_attr[:, 1].numpy()
+
+# Only the upper triangle - each undirected contact is stored twice (i->j and j->i)
+tri_mask = src < dst
+src, dst, weights = src[tri_mask], dst[tri_mask], weights[tri_mask]
+
+fig = plt.figure(figsize=(15, 11))
+gs = fig.add_gridspec(2, 2, height_ratios=[1.3, 1], hspace=0.35, wspace=0.25)
+
+# --- Top row: full-protein overview. Scatter (not imshow) so sparse off-diagonal contacts stay visible ---
+ax1 = fig.add_subplot(gs[0, 0])
+ax1.scatter(dst, src, s=6, c="black", marker="s")
+ax1.set_title(f"{example_id}: Contact Map (Cα < {DISTANCE_CUTOFF_ANGSTROM} A)\nEvery dot = one edge in the graph", fontsize=11)
+ax1.set_xlabel("Residue index"); ax1.set_ylabel("Residue index")
+ax1.set_xlim(0, n); ax1.set_ylim(n, 0); ax1.set_aspect("equal")
+
+ax2 = fig.add_subplot(gs[0, 1])
+sca = ax2.scatter(dst, src, s=6, c=weights, cmap="viridis", vmin=0, vmax=1, marker="s")
+ax2.set_title(f"{example_id}: PAE-Derived Edge Weight\nBrighter = AlphaFold more confident", fontsize=11)
+ax2.set_xlabel("Residue index"); ax2.set_ylabel("Residue index")
+ax2.set_xlim(0, n); ax2.set_ylim(n, 0); ax2.set_aspect("equal")
+plt.colorbar(sca, ax=ax2, shrink=0.8, label="Edge weight")
+
+# --- Bottom row: zoomed into the BRCT domain (well-folded, C-terminal region) ---
+ZOOM_START, ZOOM_END = 1600, 1863
+zmask = (src >= ZOOM_START) & (src < ZOOM_END) & (dst >= ZOOM_START) & (dst < ZOOM_END)
+zsrc, zdst, zweights = src[zmask], dst[zmask], weights[zmask]
+
+ax3 = fig.add_subplot(gs[1, 0])
+ax3.scatter(zdst, zsrc, s=30, c="black", marker="s")
+ax3.set_title(f"Zoomed in: residues {ZOOM_START}-{ZOOM_END} (BRCT domain - folded region)", fontsize=10)
+ax3.set_xlabel("Residue index"); ax3.set_ylabel("Residue index")
+ax3.set_xlim(ZOOM_START, ZOOM_END); ax3.set_ylim(ZOOM_END, ZOOM_START); ax3.set_aspect("equal")
+
+ax4 = fig.add_subplot(gs[1, 1])
+sca2 = ax4.scatter(zdst, zsrc, s=30, c=zweights, cmap="viridis", vmin=0, vmax=1, marker="s")
+ax4.set_title(f"Zoomed in: residues {ZOOM_START}-{ZOOM_END} (PAE confidence)", fontsize=10)
+ax4.set_xlabel("Residue index"); ax4.set_ylabel("Residue index")
+ax4.set_xlim(ZOOM_START, ZOOM_END); ax4.set_ylim(ZOOM_END, ZOOM_START); ax4.set_aspect("equal")
+plt.colorbar(sca2, ax=ax4, shrink=0.8, label="Edge weight")
+
+plt.suptitle(f"{example_id} (BRCA1): Full Protein vs. Zoomed-In Fol
+
+--- CELL 24 markdown ---
+## 10. Visualizing a Local Graph Neighborhood (For a Non-Specialist Audience)
+The full protein graph (1,863 nodes for BRCA1 alone) is too dense to draw in a way anyone could read. Instead, we zoom into the **immediate neighborhood of a single real variant** — the mutated residue itself, plus every residue directly connected to it (its 1-hop neighbors) — to show concretely what a 'node' and an 'edge' actually are in this project.
+
+**How to read this figure:**
+- Each circle is one amino acid (a node), labelled with its identity and position (e.g. `C64` = Cysteine at position 64).
+- The **red** circle is the variant position itself — this is the node the GNN will mark with the variant-site flag and substituted-residue identity described in Section 6.
+- A line between two circles (an edge) means those two residues are within 8 Å of each other in the real 3D fold — note several of these neighbors are far apart in the sequence (e.g. residue 39 connecting to residue 64), which is only visible because we used the *3D structure*, not just the linear sequence.
+- The **color and thickness** of each line is the PAE-derived confidence weight from Section 4 — brighter/thicker = AlphaFold is more confident about that pair's relative position; darker/thinner = less confident. This is the literal quantity the GNN's message-passing will weight by.
+
+--- CELL 26 code ---
+import networkx as nx
+
+viz_uniprot_id = "P38398"  # BRCA1, consistent with earlier examples in this notebook
+g_viz = torch.load(os.path.join(GRAPH_DIR, f"{viz_uniprot_id}.pt"), weights_only=False)
+with open(os.path.join(META_DIR, f"{viz_uniprot_id}.json")) as f:
+    viz_seq = json.load(f)["uniprotSequence"]
+
+viz_variants = graph_ready_df[graph_ready_df["UniProt_ID"] == viz_uniprot_id]
+example_variant = viz_variants[viz_variants["Target"] == 1].iloc[0]
+center_node = int(example_variant["Pos"]) - 1
+
+src, dst = g_viz.edge_index.numpy()
+neighbors_1hop = (set(dst[src == center_node].tolist()) | set(src[dst == center_node].tolist())) - {center_node}
+subgraph_nodes = sorted({center_node} | neighbors_1hop)
+
+mask = np.isin(src, subgraph_nodes) & np.isin(dst, subgraph_nodes)
+sub_src, sub_dst, sub_weights = src[mask], dst[mask], g_viz.edge_attr[mask, 1].numpy()
+
+G = nx.Graph()
+for n in subgraph_nodes:
+    G.add_node(n, label=f"{viz_seq[n]}{n+1}")
+for s, d, w in zip(sub_src, sub_dst, sub_weights):
+    G.add_edge(int(s), int(d), weight=float(w))
+
+pos = nx.spring_layout(G, seed=42, k=0.8)
+node_colors = ["#E63946" if n == center_node else "#A8DADC" for n in G.nodes()]
+node_sizes = [1400 if n == center_node else 900 for n in G.nodes()]
+edge_weights_list = [G[u][v]["weight"] for u, v in G.edges()]
+edge_widths = [1 + 4 * w for w in edge_weights_list]
+
+plt.figure(figsize=(8, 7))
+nx.draw_networkx_edges(G, pos, width=edge_widths, edge_color=edge_weights_list,
+                        edge_cmap=plt.cm.viridis, edge_vmin=0, edge_vmax=1)
+nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=node_sizes, edgecolors="black")
+nx.draw_networkx_labels(G, pos, labels=nx.get_node_attributes(G, "label"), font_size=10, font_weight="bold")
+plt.title(
+    f"{viz_uniprot_id} (BRCA1): Local Graph Neighborhood Around a Real Variant\n"
+    f"{example_variant['Ref_AA']}{example_variant['Pos']}{example_variant['Alt_AA']} (Pathogenic)",
+    fontsize=12
+)
+plt.axis("off")
+sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=plt.Normalize(vmin=0, vmax=1))
+sm.set_array([])
+cbar = plt.colorbar(sm, ax=plt.gca(), shrink=0.7)
+cbar.set_label("Edge weight (PAE confidence)", fontsize=9)
+plt.tight_layout()
+plt.show()
+
+--- CELL 27 markdown ---
+## 11. Methods Summary (Copy-Paste for the Paper)
+> Each protein was represented as a graph in which nodes correspond to individual amino acid residues and edges connect residue pairs within 8 Å (Cα-Cα distance) in the AlphaFold2-predicted structure. Node features combined a 1280-dimensional ESM-2 protein language model embedding with a one-hot encoding of wild-type residue identity. Edges were weighted by AlphaFold's Predicted Aligned Error (PAE) between the residue pair, transformed as 1/(1+PAE), so that the model could learn to discount structurally uncertain contacts rather than treating all spatial contacts as equally reliable — this PAE-weighting constitutes the central architectural novelty of this work relative to prior unweighted contact-graph approaches (e.g. gMVP). Each ClinVar missense variant was represented as an instance of its protein's shared structural graph, with the mutated node's feature vector augmented by a variant-site indicator and the substituted residue's one-hot identity, labelled with the variant's ClinVar pathogenicity classification.
+
+**Supporting numbers to cite alongside this paragraph (filled in once this notebook has been run in full):**
+- Cα distance cutoff: 8 Å
+- ESM-2 checkpoint: `facebook/esm2_t33_650M_UR50D` (650M parameters, 1280-dim output)
+- Node feature dimensionality: 1321 (1280 ESM-2 + 20 wild-type one-hot + 1 variant-site flag + 20 alt-residue one-hot)
+- See `phase3_graph_manifest.csv` for per-protein graph-construction success rate, and the variant counts printed in Section 7 for the final `clinvar_graph_ready.csv` totals.
+

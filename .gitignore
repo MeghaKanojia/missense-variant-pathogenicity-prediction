@@ -1,0 +1,17 @@
+# Large derived data, rebuildable from public sources (see README "Rebuilding the data")
+alphafold_data/pae/
+alphafold_data/pdb/
+esm2_embeddings/
+protein_graphs/
+pae_minmax_experiment/protein_graphs_minmax/
+pae_directional_experiment/protein_graphs_directional/
+
+# Raw public downloads (>100 MB, exceed GitHub file limit)
+variant_summary.txt.gz
+AlphaMissense_aa_substitutions.tsv.gz
+alphamissense_test_scores.csv
+
+# Python / Jupyter clutter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

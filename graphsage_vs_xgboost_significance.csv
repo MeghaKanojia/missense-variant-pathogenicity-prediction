@@ -1,0 +1,2 @@
+comparison,mcnemar_p,bootstrap_auprc_diff,bootstrap_ci_low,bootstrap_ci_high,bootstrap_p,delong_p,significant
+GraphSAGE (baseline) vs XGBoost (structure-free baseline),0.6528377469381212,0.002420733602514358,-0.001934769265791858,0.006723367531363733,0.264,0.008483931816577472,True

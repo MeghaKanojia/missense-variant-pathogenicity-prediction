@@ -1,0 +1,26 @@
+{
+  "run_started_utc": "2026-07-17T22:04:34.415470+00:00",
+  "run_finished_utc": "2026-07-17T23:32:22.415443+00:00",
+  "device_used": "cuda",
+  "clinvar_dump_file": "variant_summary.txt.gz",
+  "clinvar_dump_mtime_utc": "2026-06-17T22:58:13.253026+00:00",
+  "clinvar_dump_head_sha256": "f8df8dc3dabb3e915fc766161976c6b5a1a34ff01f5d800cc1e421c98348d93f",
+  "model_checkpoint": "models\\gatv2_pae_weighted_final_best.pt",
+  "best_config": {
+    "name": "B_reg_small",
+    "lr": 0.0003,
+    "dropout": 0.4,
+    "hidden_dim": 64.0,
+    "weight_decay": 0.0001,
+    "best_val_auprc": 0.9110704
+  },
+  "n_vus_scored": 207266,
+  "n_proteins_covered": 4053,
+  "n_genes_covered": 4060,
+  "pct_predicted_pathogenic_at_0.5": 28.453291905088147,
+  "pct_predicted_benign_at_0.5": 71.54670809491185,
+  "mean_predicted_probability": 0.31161615248457597,
+  "median_predicted_probability": 0.1370674893260002,
+  "std_predicted_probability": 0.34370101068352077,
+  "note": "Descriptive only. VUS have no ground-truth label, so these predictions cannot be validated the way every other result in this project was. This summary and vus_predictions.csv are the frozen, authoritative record of this run; re-running this script after ClinVar publishes a new variant_summary.txt.gz would see a different, larger, and partly reclassified VUS pool, which is exactly why these outputs are saved rather than recomputed on demand."
+}

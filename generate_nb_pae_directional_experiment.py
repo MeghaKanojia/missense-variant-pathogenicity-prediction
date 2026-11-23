@@ -1,0 +1,808 @@
+import json, uuid
+
+
+def cid():
+    return str(uuid.uuid4())[:8]
+
+
+def code(*lines):
+    return {"cell_type": "code", "execution_count": None, "id": cid(),
+            "metadata": {}, "outputs": [], "source": list(lines)}
+
+
+def md(*lines):
+    return {"cell_type": "markdown", "id": cid(), "metadata": {}, "source": list(lines)}
+
+
+cells = []
+
+# ── Header ──────────────────────────────────────────────────────────────────
+cells.append(md(
+    "# Supplementary Experiment: Directional PAE Edge Features\n",
+    "A second, independent robustness check on the project's central negative result "
+    "(PAE-weighting via `1/(1+PAE)` does not beat an unweighted GATv2 ablation). This notebook "
+    "tests a **genuinely new source of information**, not another rescaling of the same number: "
+    "AlphaFold's PAE matrix is not symmetric, and the existing pipeline throws away that "
+    "asymmetry by averaging `PAE[i][j]` and `PAE[j][i]` into one scalar before anything else "
+    "happens. This notebook keeps both directions as separate edge features instead.\n",
+    "\n",
+    "**Why this is different from the min-max normalization experiment "
+    "(`pae_minmax_experiment/`):** that experiment showed per-protein standard deviation and the "
+    "fraction of tied edges were *identical* between the original transform and min-max "
+    "normalization — because both are monotonic reparametrizations of the same underlying "
+    "number, and a monotonic function cannot un-tie two edges that already had the same PAE. "
+    "This experiment is not a reparametrization — it adds a feature dimension the model never "
+    "had access to before.\n",
+    "\n",
+    "### The diagnostic that motivates this\n",
+    "On the same 300-protein sample used throughout this project: every edge sampled was tied "
+    "with at least one other edge in its protein on the symmetrized PAE value (a near-inevitable "
+    "consequence of averaging + AlphaFold's coarse ~1 Å quantization). Of those tied edges, "
+    "**32.8%** actually have `PAE[i][j] != PAE[j][i]` — meaning the *raw* AlphaFold output already "
+    "distinguishes them; the averaging step in the existing pipeline is what erases that "
+    "distinction, not a fundamental data limit. The other 67.2% of ties are genuine — AlphaFold "
+    "really did report identical confidence in both directions — so this is a **partial**, "
+    "honestly-scoped fix, not a claim that it resolves the whole saturation problem.\n",
+    "\n",
+    "### The change\n",
+    "```\n",
+    "OLD edge_attr (2-dim): [distance, 1/(1 + average(PAE[i][j], PAE[j][i]))]\n",
+    "NEW edge_attr (3-dim): [distance, 1/(1 + PAE[src][dst]), 1/(1 + PAE[dst][src])]\n",
+    "```\n",
+    "`GATv2Conv`'s `edge_dim` parameter is simply set to 3 instead of 2 — `models.py` already "
+    "supports this via its existing `edge_dim` constructor argument, so **no changes to the "
+    "shared `models.py` or `missense_dataset.py` files are needed.**\n",
+    "\n",
+    "**Does not modify any existing notebook, checkpoint, or result file.** Every output is "
+    "written under `pae_directional_experiment/`. All existing project files "
+    "(`protein_graphs/`, `models/`, `phase4_*.csv`, `phase5_*.csv`, `clinvar_graph_ready.csv`, "
+    "`best_config.json`) are only ever **read**.\n",
+    "\n",
+    "**Inputs (all read-only):**\n",
+    "- `clinvar_graph_ready.csv`, `protein_graphs/{UniProt_ID}.pt` — topology and node features reused "
+    "unchanged; only `edge_attr` is rebuilt with a 3rd column\n",
+    "- `alphafold_data/pae/{UniProt_ID}.json` — raw PAE matrices (already cached from Phase 2)\n",
+    "- `best_config.json`, `models/gatv2_unweighted_best.pt`, `models/gatv2_unweighted_final_best.pt`, "
+    "`phase5_gnn_predictions.csv`, `alphamissense_test_scores.csv` — reused exactly as in the "
+    "min-max experiment, for the same reasons (unweighted ablation never reads `edge_attr` "
+    "regardless of its shape, so retraining it again would waste ~14h reproducing known numbers)\n",
+    "\n",
+    "**Outputs (all new, under `pae_directional_experiment/`):**\n",
+    "- `protein_graphs_directional/{UniProt_ID}.pt` — 6,597 rebuilt graphs, 3-dim edge_attr\n",
+    "- `models/gatv2_pae_directional_default_best.pt`, `models/gatv2_pae_directional_tuned_best.pt`\n",
+    "- `training_history_*.csv`, `figures/training_curves_*.png`\n",
+    "- `tie_breaking_diagnostic.csv` — proof of how many ties this actually breaks, checked before training\n",
+    "- `results_comparison.csv`, `significance_tests.csv`, `pae_value_quantification_directional.csv`\n",
+    "- `alphamissense_comparison_results.csv`, `alphamissense_significance_tests.csv`, "
+    "`figures/alphamissense_comparison_directional.png`\n",
+    "- `predictions_cache.csv`\n",
+))
+
+# ── Imports & setup ───────────────────────────────────────────────────────────
+cells.append(code(
+    "import os, json, random\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import torch\n",
+    "import torch.nn as nn\n",
+    "import matplotlib.pyplot as plt\n",
+    "from tqdm.notebook import tqdm\n",
+    "from torch.utils.data import Sampler\n",
+    "from torch_geometric.data import Data\n",
+    "from torch_geometric.loader import DataLoader\n",
+    "from scipy import stats\n",
+    "from sklearn.metrics import (average_precision_score, roc_auc_score, precision_score,\n",
+    "                              recall_score, f1_score, accuracy_score)\n",
+    "from statsmodels.stats.contingency_tables import mcnemar\n",
+    "\n",
+    "from missense_dataset import MissenseVariantGraphDataset, NODE_FEATURE_DIM\n",
+    "from models import GATv2Classifier\n",
+    "\n",
+    "DEVICE = \"cuda\" if torch.cuda.is_available() else \"cpu\"\n",
+    "print(f\"Using device: {DEVICE}\")\n",
+    "if DEVICE == \"cuda\":\n",
+    "    print(f\"GPU: {torch.cuda.get_device_name(0)}\")\n",
+    "    print(f\"VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB\")\n",
+    "\n",
+    "# --- Read-only sources from the existing project (never written to) ---\n",
+    "OLD_GRAPH_DIR   = \"protein_graphs\"\n",
+    "OLD_MODELS_DIR  = \"models\"\n",
+    "PAE_DIR         = os.path.join(\"alphafold_data\", \"pae\")\n",
+    "BEST_CONFIG_PATH = \"best_config.json\"\n",
+    "PHASE5_PRED_CACHE = \"phase5_gnn_predictions.csv\"\n",
+    "AM_CACHE_PATH = \"alphamissense_test_scores.csv\"\n",
+    "\n",
+    "# --- New, isolated output tree for this experiment only ---\n",
+    "EXPERIMENT_DIR = \"pae_directional_experiment\"\n",
+    "NEW_GRAPH_DIR  = os.path.join(EXPERIMENT_DIR, \"protein_graphs_directional\")\n",
+    "NEW_MODELS_DIR = os.path.join(EXPERIMENT_DIR, \"models\")\n",
+    "NEW_FIGURES_DIR = os.path.join(EXPERIMENT_DIR, \"figures\")\n",
+    "for d in (EXPERIMENT_DIR, NEW_GRAPH_DIR, NEW_MODELS_DIR, NEW_FIGURES_DIR):\n",
+    "    os.makedirs(d, exist_ok=True)\n",
+    "\n",
+    "EDGE_DIM = 3  # [distance, forward-direction weight, reverse-direction weight]\n",
+    "\n",
+    "torch.manual_seed(42)\n",
+    "np.random.seed(42)\n",
+))
+
+# ── Section 1 ──────────────────────────────────────────────────────────────────
+cells.append(md(
+    "## 1. Load Phase 3 Output (read-only)\n",
+))
+cells.append(code(
+    "df = pd.read_csv(\"clinvar_graph_ready.csv\")\n",
+    "print(f\"Total variants : {len(df):,}\")\n",
+    "print(f\"Unique proteins: {df['UniProt_ID'].nunique():,}\")\n",
+    "print(f\"  Pathogenic (1): {(df['Target']==1).sum():,}\")\n",
+    "print(f\"  Benign     (0): {(df['Target']==0).sum():,}\")\n",
+))
+
+# ── Section 2: rebuild graphs with directional edge features ─────────────────
+cells.append(md(
+    "## 2. Rebuild All Protein Graphs With Directional PAE Features\n",
+    "Reuses each protein's cached topology, node features, and Cα-Cα distances unchanged — only "
+    "`edge_attr` grows from 2 columns to 3: `[distance, 1/(1+PAE[src][dst]), 1/(1+PAE[dst][src])]`. "
+    "For a directed arc `(src, dst)`, `PAE[src][dst]` is that arc's own directional confidence and "
+    "`PAE[dst][src]` is the reverse direction's — both stored explicitly rather than averaged away. "
+    "No PDB re-parsing, no ESM-2 recomputation. Resumable exactly like Phase 2/3 and the min-max "
+    "experiment.\n",
+))
+cells.append(code(
+    "def rebuild_graph_directional(uniprot_id):\n",
+    "    out_path = os.path.join(NEW_GRAPH_DIR, f\"{uniprot_id}.pt\")\n",
+    "    if os.path.exists(out_path):\n",
+    "        return \"cached\"\n",
+    "    old_path = os.path.join(OLD_GRAPH_DIR, f\"{uniprot_id}.pt\")\n",
+    "    pae_path = os.path.join(PAE_DIR, f\"{uniprot_id}.json\")\n",
+    "    if not (os.path.exists(old_path) and os.path.exists(pae_path)):\n",
+    "        return \"missing_source_file\"\n",
+    "\n",
+    "    g = torch.load(old_path, weights_only=False)\n",
+    "    with open(pae_path) as f:\n",
+    "        pae_matrix = np.array(json.load(f)[0][\"predicted_aligned_error\"], dtype=np.float32)\n",
+    "    if pae_matrix.shape[0] != g.x.shape[0]:\n",
+    "        return \"pae_shape_mismatch\"\n",
+    "\n",
+    "    src, dst = g.edge_index.numpy()\n",
+    "    weight_fwd = 1.0 / (1.0 + pae_matrix[src, dst])\n",
+    "    weight_rev = 1.0 / (1.0 + pae_matrix[dst, src])\n",
+    "    distances = g.edge_attr[:, 0].numpy()  # unchanged\n",
+    "\n",
+    "    new_edge_attr = torch.tensor(\n",
+    "        np.stack([distances, weight_fwd.astype(np.float32), weight_rev.astype(np.float32)], axis=1),\n",
+    "        dtype=torch.float)\n",
+    "\n",
+    "    new_g = Data(x=g.x, edge_index=g.edge_index, edge_attr=new_edge_attr,\n",
+    "                 uniprot_id=uniprot_id, num_residues=g.num_residues)\n",
+    "    torch.save(new_g, out_path)\n",
+    "    return \"success\"\n",
+    "\n",
+    "\n",
+    "unique_proteins = df[\"UniProt_ID\"].unique()\n",
+    "rebuild_status = {}\n",
+    "for uid in tqdm(unique_proteins, desc=\"Rebuilding graphs (directional PAE)\"):\n",
+    "    rebuild_status[uid] = rebuild_graph_directional(uid)\n",
+    "\n",
+    "status_counts = pd.Series(rebuild_status).value_counts()\n",
+    "print(\"\\nGraph rebuild status:\")\n",
+    "print(status_counts.to_string())\n",
+    "failed = {k: v for k, v in rebuild_status.items() if v not in (\"cached\", \"success\")}\n",
+    "if failed:\n",
+    "    print(f\"\\nWARNING: {len(failed)} proteins failed to rebuild.\")\n",
+))
+
+# ── Section 3: tie-breaking diagnostic ────────────────────────────────────────
+cells.append(md(
+    "## 3. Diagnostic: How Many Ties Does This Actually Break?\n",
+    "Checked **before** the ~14 hour training commitment, on the same 300-protein sample "
+    "(seed=0) used throughout this project, so the numbers below are directly comparable to "
+    "the earlier saturation and min-max diagnostics.\n",
+))
+cells.append(code(
+    "rng_diag = np.random.RandomState(0)\n",
+    "sample_proteins_diag = rng_diag.choice(df[\"UniProt_ID\"].unique(), size=300, replace=False)\n",
+    "\n",
+    "n_edges_total = 0\n",
+    "n_tied_on_avg = 0\n",
+    "n_tied_broken_by_direction = 0\n",
+    "\n",
+    "for uid in tqdm(sample_proteins_diag, desc=\"Checking tie-breaking\"):\n",
+    "    old_g = torch.load(os.path.join(OLD_GRAPH_DIR, f\"{uid}.pt\"), weights_only=False)\n",
+    "    new_g = torch.load(os.path.join(NEW_GRAPH_DIR, f\"{uid}.pt\"), weights_only=False)\n",
+    "    pae_sym = old_g.edge_attr[:, 1].numpy()  # old symmetrized weight, used only to find ties\n",
+    "    weight_fwd = new_g.edge_attr[:, 1].numpy()\n",
+    "    weight_rev = new_g.edge_attr[:, 2].numpy()\n",
+    "\n",
+    "    n_edges_total += len(pae_sym)\n",
+    "    vals, counts = np.unique(pae_sym, return_counts=True)\n",
+    "    tied_mask = np.isin(pae_sym, vals[counts > 1])\n",
+    "    n_tied_on_avg += tied_mask.sum()\n",
+    "    directional_differs = np.abs(weight_fwd - weight_rev) > 1e-6\n",
+    "    n_tied_broken_by_direction += (tied_mask & directional_differs).sum()\n",
+    "\n",
+    "frac_tied = n_tied_on_avg / n_edges_total\n",
+    "frac_broken = n_tied_broken_by_direction / max(n_tied_on_avg, 1)\n",
+    "print(f\"Sampled {len(sample_proteins_diag)} proteins, {n_edges_total:,} total edges\")\n",
+    "print(f\"Edges tied under the old symmetrized transform: {n_tied_on_avg:,} ({frac_tied:.1%})\")\n",
+    "print(f\"Of those, fraction now distinguishable via directional features: {frac_broken:.1%}\")\n",
+    "print(f\"(Expect roughly a third broken, two-thirds genuinely tied even with full directional info \"\n",
+    "      f\"- this is a partial fix, not a complete one, per the earlier diagnostic.)\")\n",
+    "\n",
+    "pd.DataFrame([{\"n_edges_sampled\": n_edges_total, \"n_tied_old\": n_tied_on_avg,\n",
+    "               \"frac_tied_old\": frac_tied, \"n_tied_broken_by_direction\": n_tied_broken_by_direction,\n",
+    "               \"frac_of_ties_broken\": frac_broken}]\n",
+    "             ).to_csv(os.path.join(EXPERIMENT_DIR, \"tie_breaking_diagnostic.csv\"), index=False)\n",
+))
+
+# ── Section 4: split, batching, pos_weight ────────────────────────────────────
+cells.append(md(
+    "## 4. Train/Val/Test Split, Batching, Class Weighting\n",
+    "Identical logic and seed (42) to Phase 4/5 and the min-max experiment — reproduced here so "
+    "this notebook has zero import-time dependency on any other notebook having been run.\n",
+))
+cells.append(code(
+    "def make_protein_split(df, seed, train_frac=0.70, val_frac=0.15):\n",
+    "    rng = np.random.RandomState(seed)\n",
+    "    unique_proteins = df[\"UniProt_ID\"].unique().copy()\n",
+    "    rng.shuffle(unique_proteins)\n",
+    "    n = len(unique_proteins)\n",
+    "    n_train, n_val = int(n * train_frac), int(n * val_frac)\n",
+    "    train_p = set(unique_proteins[:n_train])\n",
+    "    val_p   = set(unique_proteins[n_train:n_train + n_val])\n",
+    "    test_p  = set(unique_proteins[n_train + n_val:])\n",
+    "    assert train_p.isdisjoint(val_p) and train_p.isdisjoint(test_p) and val_p.isdisjoint(test_p)\n",
+    "    return (df[df[\"UniProt_ID\"].isin(p)].reset_index(drop=True) for p in (train_p, val_p, test_p))\n",
+    "\n",
+    "\n",
+    "train_df, val_df, test_df = make_protein_split(df, seed=42)\n",
+    "print(\"Protein-level split is leak-free (verified disjoint by assertion above).\")\n",
+    "for name, sub in [(\"Train\", train_df), (\"Val\", val_df), (\"Test\", test_df)]:\n",
+    "    frac = (sub[\"Target\"] == 1).mean()\n",
+    "    print(f\"{name:5s}: {len(sub):6,} variants, {sub['UniProt_ID'].nunique():4,} proteins, \"\n",
+    "          f\"{frac:.3f} pathogenic fraction\")\n",
+))
+cells.append(code(
+    "class NodeBudgetBatchSampler(Sampler):\n",
+    "    def __init__(self, node_counts, max_nodes_per_batch=20000, shuffle=True, seed=0):\n",
+    "        self.node_counts = node_counts\n",
+    "        self.max_nodes_per_batch = max_nodes_per_batch\n",
+    "        self.shuffle = shuffle\n",
+    "        self.seed = seed\n",
+    "        self._epoch = 0\n",
+    "\n",
+    "    def __iter__(self):\n",
+    "        indices = list(range(len(self.node_counts)))\n",
+    "        if self.shuffle:\n",
+    "            r = random.Random(self.seed + self._epoch)\n",
+    "            r.shuffle(indices)\n",
+    "            self._epoch += 1\n",
+    "        batch, current = [], 0\n",
+    "        for idx in indices:\n",
+    "            n = self.node_counts[idx]\n",
+    "            if batch and current + n > self.max_nodes_per_batch:\n",
+    "                yield batch\n",
+    "                batch, current = [], 0\n",
+    "            batch.append(idx)\n",
+    "            current += n\n",
+    "        if batch:\n",
+    "            yield batch\n",
+    "\n",
+    "    def __len__(self):\n",
+    "        return max(1, sum(self.node_counts) // self.max_nodes_per_batch)\n",
+    "\n",
+    "\n",
+    "def get_node_counts(variant_df, graph_dir):\n",
+    "    cache, counts = {}, []\n",
+    "    for uid in variant_df[\"UniProt_ID\"]:\n",
+    "        if uid not in cache:\n",
+    "            cache[uid] = torch.load(os.path.join(graph_dir, f\"{uid}.pt\"), weights_only=False).num_residues\n",
+    "        counts.append(cache[uid])\n",
+    "    return counts\n",
+    "\n",
+    "\n",
+    "train_ds = MissenseVariantGraphDataset(train_df, NEW_GRAPH_DIR)\n",
+    "val_ds   = MissenseVariantGraphDataset(val_df, NEW_GRAPH_DIR)\n",
+    "test_ds  = MissenseVariantGraphDataset(test_df, NEW_GRAPH_DIR)\n",
+    "\n",
+    "train_loader = DataLoader(train_ds, batch_sampler=NodeBudgetBatchSampler(\n",
+    "    get_node_counts(train_df, NEW_GRAPH_DIR), 20000, shuffle=True, seed=42))\n",
+    "val_loader = DataLoader(val_ds, batch_sampler=NodeBudgetBatchSampler(\n",
+    "    get_node_counts(val_df, NEW_GRAPH_DIR), 20000, shuffle=False))\n",
+    "test_loader = DataLoader(test_ds, batch_sampler=NodeBudgetBatchSampler(\n",
+    "    get_node_counts(test_df, NEW_GRAPH_DIR), 20000, shuffle=False))\n",
+    "\n",
+    "train_pos = (train_df[\"Target\"] == 1).sum()\n",
+    "train_neg = (train_df[\"Target\"] == 0).sum()\n",
+    "pos_weight_value = train_neg / train_pos\n",
+    "print(f\"pos_weight = {pos_weight_value:.3f}\")\n",
+    "POS_WEIGHT = torch.tensor([pos_weight_value], dtype=torch.float, device=DEVICE)\n",
+))
+
+# ── Section 5: training / eval infra ──────────────────────────────────────────
+cells.append(md(
+    "## 5. Training and Evaluation Functions\n",
+    "Identical methodology to Phase 4 and the min-max experiment (`run_epoch`, `train_model`, "
+    "`full_metrics`, `evaluate_gnn`) — same loss, same AUPRC-driven early stopping (patience=10, "
+    "up to 60 epochs), same resumability contract.\n",
+))
+cells.append(code(
+    "def run_epoch(model, loader, pos_weight, optimizer=None):\n",
+    "    is_train = optimizer is not None\n",
+    "    model.train() if is_train else model.eval()\n",
+    "    losses, all_logits, all_labels = [], [], []\n",
+    "    with torch.set_grad_enabled(is_train):\n",
+    "        for batch in loader:\n",
+    "            batch = batch.to(DEVICE)\n",
+    "            if is_train:\n",
+    "                optimizer.zero_grad()\n",
+    "            logits = model(batch)\n",
+    "            loss = nn.functional.binary_cross_entropy_with_logits(logits, batch.y, pos_weight=pos_weight)\n",
+    "            if is_train:\n",
+    "                loss.backward()\n",
+    "                optimizer.step()\n",
+    "            losses.append(loss.item())\n",
+    "            all_logits.extend(logits.detach().cpu().numpy().tolist())\n",
+    "            all_labels.extend(batch.y.detach().cpu().numpy().tolist())\n",
+    "    auprc = average_precision_score(all_labels, all_logits)\n",
+    "    auroc = roc_auc_score(all_labels, all_logits)\n",
+    "    return float(np.mean(losses)), auprc, auroc\n",
+    "\n",
+    "\n",
+    "def train_model(model, model_name, train_loader, val_loader, pos_weight, n_epochs=60, patience=10,\n",
+    "                lr=1e-3, weight_decay=1e-5, verbose=True, resume=True):\n",
+    "    checkpoint_path = os.path.join(NEW_MODELS_DIR, f\"{model_name}_best.pt\")\n",
+    "    history_path = os.path.join(EXPERIMENT_DIR, f\"training_history_{model_name}.csv\")\n",
+    "\n",
+    "    if resume and os.path.exists(checkpoint_path) and os.path.exists(history_path):\n",
+    "        model.to(DEVICE)\n",
+    "        model.load_state_dict(torch.load(checkpoint_path, weights_only=True))\n",
+    "        if verbose:\n",
+    "            print(f\"[{model_name}] Found existing checkpoint - skipping training and reloading it. \"\n",
+    "                  f\"Delete {checkpoint_path} first if you want to retrain from scratch.\")\n",
+    "        history_df = pd.read_csv(history_path)\n",
+    "        return model, history_df, history_df[\"val_auprc\"].max()\n",
+    "\n",
+    "    model.to(DEVICE)\n",
+    "    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)\n",
+    "    best_val_auprc = -1.0\n",
+    "    epochs_without_improvement = 0\n",
+    "    history = []\n",
+    "\n",
+    "    for epoch in range(1, n_epochs + 1):\n",
+    "        train_loss, train_auprc, train_auroc = run_epoch(model, train_loader, pos_weight, optimizer)\n",
+    "        val_loss, val_auprc, val_auroc = run_epoch(model, val_loader, pos_weight, optimizer=None)\n",
+    "        history.append({\"epoch\": epoch, \"train_loss\": train_loss, \"train_auprc\": train_auprc,\n",
+    "                         \"train_auroc\": train_auroc, \"val_loss\": val_loss, \"val_auprc\": val_auprc,\n",
+    "                         \"val_auroc\": val_auroc})\n",
+    "        if verbose:\n",
+    "            print(f\"[{model_name}] epoch {epoch:2d}: train_loss={train_loss:.4f} train_AUPRC={train_auprc:.3f} \"\n",
+    "                  f\"| val_loss={val_loss:.4f} val_AUPRC={val_auprc:.3f} val_AUROC={val_auroc:.3f}\")\n",
+    "        if val_auprc > best_val_auprc:\n",
+    "            best_val_auprc = val_auprc\n",
+    "            epochs_without_improvement = 0\n",
+    "            torch.save(model.state_dict(), checkpoint_path)\n",
+    "        else:\n",
+    "            epochs_without_improvement += 1\n",
+    "            if epochs_without_improvement >= patience:\n",
+    "                if verbose:\n",
+    "                    print(f\"[{model_name}] Early stopping at epoch {epoch} (no improvement for {patience} epochs)\")\n",
+    "                break\n",
+    "\n",
+    "    model.load_state_dict(torch.load(checkpoint_path, weights_only=True))\n",
+    "    history_df = pd.DataFrame(history)\n",
+    "    history_df.to_csv(history_path, index=False)\n",
+    "    del optimizer\n",
+    "    if DEVICE == \"cuda\":\n",
+    "        torch.cuda.empty_cache()\n",
+    "    return model, history_df, best_val_auprc\n",
+    "\n",
+    "\n",
+    "def plot_training_curves(history_df, model_name, safe_name):\n",
+    "    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))\n",
+    "    axes[0].plot(history_df[\"epoch\"], history_df[\"train_loss\"], label=\"train loss\")\n",
+    "    axes[0].plot(history_df[\"epoch\"], history_df[\"val_loss\"], label=\"val loss\")\n",
+    "    axes[0].set_xlabel(\"Epoch\"); axes[0].set_ylabel(\"Loss\"); axes[0].set_title(f\"{model_name}: Loss\")\n",
+    "    axes[0].legend()\n",
+    "    axes[1].plot(history_df[\"epoch\"], history_df[\"train_auprc\"], label=\"train AUPRC\")\n",
+    "    axes[1].plot(history_df[\"epoch\"], history_df[\"val_auprc\"], label=\"val AUPRC\")\n",
+    "    axes[1].set_xlabel(\"Epoch\"); axes[1].set_ylabel(\"AUPRC\"); axes[1].set_title(f\"{model_name}: AUPRC\")\n",
+    "    axes[1].legend()\n",
+    "    plt.tight_layout()\n",
+    "    fig.savefig(os.path.join(NEW_FIGURES_DIR, f\"training_curves_{safe_name}.png\"), dpi=200, bbox_inches=\"tight\")\n",
+    "    plt.show()\n",
+    "    plt.close(fig)\n",
+    "\n",
+    "\n",
+    "def full_metrics(labels, probs, threshold=0.5):\n",
+    "    preds = (np.asarray(probs) >= threshold).astype(int)\n",
+    "    return {\n",
+    "        \"AUPRC\": average_precision_score(labels, probs),\n",
+    "        \"AUROC\": roc_auc_score(labels, probs),\n",
+    "        \"Accuracy\": accuracy_score(labels, preds),\n",
+    "        \"Precision\": precision_score(labels, preds, zero_division=0),\n",
+    "        \"Recall\": recall_score(labels, preds, zero_division=0),\n",
+    "        \"F1\": f1_score(labels, preds, zero_division=0),\n",
+    "    }\n",
+    "\n",
+    "\n",
+    "def evaluate_gnn(model, loader):\n",
+    "    model.eval()\n",
+    "    all_logits, all_labels = [], []\n",
+    "    with torch.no_grad():\n",
+    "        for batch in loader:\n",
+    "            batch = batch.to(DEVICE)\n",
+    "            logits = model(batch)\n",
+    "            all_logits.extend(logits.cpu().numpy().tolist())\n",
+    "            all_labels.extend(batch.y.cpu().numpy().tolist())\n",
+    "    probs = torch.sigmoid(torch.tensor(all_logits)).numpy()\n",
+    "    return np.array(all_labels), probs\n",
+))
+
+# ── Section 6: train default-config model ─────────────────────────────────────
+cells.append(md(
+    "## 6. Train GATv2 (Directional PAE), Default Hyperparameters\n",
+    "Same defaults as the project's original pass: `hidden_dim=128, heads=4, dropout=0.2, lr=1e-3, "
+    "weight_decay=1e-5`. `edge_dim=3` is the only architectural difference from the original "
+    "PAE-weighted model.\n",
+))
+cells.append(code(
+    "model_directional_default = GATv2Classifier(in_dim=NODE_FEATURE_DIM, use_edge_attr=True, edge_dim=EDGE_DIM)\n",
+    "model_directional_default, history_directional_default, _ = train_model(\n",
+    "    model_directional_default, \"gatv2_pae_directional_default\", train_loader, val_loader, POS_WEIGHT)\n",
+    "plot_training_curves(history_directional_default, \"GATv2 (directional PAE, default)\", \"gatv2_pae_directional_default\")\n",
+))
+
+# ── Section 7: train tuned-config model ───────────────────────────────────────
+cells.append(md(
+    "## 7. Train GATv2 (Directional PAE), Tuned `B_reg_small` Config\n",
+    "Reuses the project's existing winning hyperparameters from `best_config.json` (read-only).\n",
+))
+cells.append(code(
+    "with open(BEST_CONFIG_PATH) as f:\n",
+    "    best_config = json.load(f)\n",
+    "print(f\"Loaded best_config: {best_config['name']}  hidden_dim={int(best_config['hidden_dim'])}  \"\n",
+    "      f\"dropout={best_config['dropout']:.2f}  lr={best_config['lr']}  wd={best_config['weight_decay']}\")\n",
+    "\n",
+    "model_directional_tuned = GATv2Classifier(in_dim=NODE_FEATURE_DIM, use_edge_attr=True, edge_dim=EDGE_DIM,\n",
+    "                                           hidden_dim=int(best_config[\"hidden_dim\"]), dropout=best_config[\"dropout\"])\n",
+    "model_directional_tuned, history_directional_tuned, _ = train_model(\n",
+    "    model_directional_tuned, \"gatv2_pae_directional_tuned\", train_loader, val_loader, POS_WEIGHT,\n",
+    "    lr=best_config[\"lr\"], weight_decay=best_config[\"weight_decay\"])\n",
+    "plot_training_curves(history_directional_tuned, \"GATv2 (directional PAE, tuned)\", \"gatv2_pae_directional_tuned\")\n",
+))
+
+# ── Section 8: reload unweighted (no retrain) ─────────────────────────────────
+cells.append(md(
+    "## 8. Reload the Existing Unweighted Ablation (No Retraining)\n",
+    "Same reasoning as the min-max experiment: `use_edge_attr=False` means `forward()` never reads "
+    "`edge_attr` regardless of its shape (2-dim or 3-dim), so the unweighted ablation's "
+    "predictions are provably unaffected by this change. Its existing checkpoints are reloaded "
+    "for inference only.\n",
+))
+cells.append(code(
+    "model_unweighted_default = GATv2Classifier(in_dim=NODE_FEATURE_DIM, use_edge_attr=False)\n",
+    "model_unweighted_default.load_state_dict(\n",
+    "    torch.load(os.path.join(OLD_MODELS_DIR, \"gatv2_unweighted_best.pt\"), weights_only=True))\n",
+    "model_unweighted_default.to(DEVICE)\n",
+    "\n",
+    "model_unweighted_tuned = GATv2Classifier(in_dim=NODE_FEATURE_DIM, use_edge_attr=False,\n",
+    "                                          hidden_dim=int(best_config[\"hidden_dim\"]), dropout=best_config[\"dropout\"])\n",
+    "model_unweighted_tuned.load_state_dict(\n",
+    "    torch.load(os.path.join(OLD_MODELS_DIR, \"gatv2_unweighted_final_best.pt\"), weights_only=True))\n",
+    "model_unweighted_tuned.to(DEVICE)\n",
+    "\n",
+    "print(\"Reloaded both existing unweighted checkpoints (no training performed).\")\n",
+))
+
+# ── Section 9: evaluate everything on test set ────────────────────────────────
+cells.append(md(
+    "## 9. Evaluate All Models on the Test Set\n",
+))
+cells.append(code(
+    "test_labels, probs_directional_default = evaluate_gnn(model_directional_default, test_loader)\n",
+    "test_labels_2, probs_directional_tuned = evaluate_gnn(model_directional_tuned, test_loader)\n",
+    "test_labels_3, probs_unweighted_default = evaluate_gnn(model_unweighted_default, test_loader)\n",
+    "test_labels_4, probs_unweighted_tuned = evaluate_gnn(model_unweighted_tuned, test_loader)\n",
+    "assert (np.array_equal(test_labels, test_labels_2) and np.array_equal(test_labels, test_labels_3)\n",
+    "        and np.array_equal(test_labels, test_labels_4)), \"Label misalignment across models - do not trust results\"\n",
+    "\n",
+    "test_df = test_df.reset_index(drop=True)\n",
+    "test_df[\"true_label\"] = test_labels.astype(int)\n",
+    "test_df[\"directional_default_prob\"] = probs_directional_default\n",
+    "test_df[\"directional_tuned_prob\"] = probs_directional_tuned\n",
+    "test_df[\"unweighted_default_prob\"] = probs_unweighted_default\n",
+    "test_df[\"unweighted_tuned_prob\"] = probs_unweighted_tuned\n",
+    "\n",
+    "pred_cache = pd.read_csv(PHASE5_PRED_CACHE)\n",
+    "test_df = test_df.merge(\n",
+    "    pred_cache[[\"VariationID\", \"gatv2_prob\", \"sage_prob\"]].rename(\n",
+    "        columns={\"gatv2_prob\": \"old_transform_tuned_prob\", \"sage_prob\": \"graphsage_prob\"}),\n",
+    "    on=\"VariationID\", how=\"left\")\n",
+    "\n",
+    "test_df.to_csv(os.path.join(EXPERIMENT_DIR, \"predictions_cache.csv\"), index=False)\n",
+    "print(f\"Cached row-level predictions for {len(test_df):,} test variants.\")\n",
+))
+
+# ── Section 10: combined results table ────────────────────────────────────────
+cells.append(md(
+    "## 10. Combined Results Table\n",
+))
+cells.append(code(
+    "new_rows = [\n",
+    "    {\"model\": \"GATv2 (directional PAE, default)\", **full_metrics(test_labels, probs_directional_default)},\n",
+    "    {\"model\": \"GATv2 (directional PAE, tuned)\", **full_metrics(test_labels, probs_directional_tuned)},\n",
+    "    {\"model\": \"GATv2 (unweighted, default) [reloaded]\", **full_metrics(test_labels, probs_unweighted_default)},\n",
+    "    {\"model\": \"GATv2 (unweighted, tuned) [reloaded]\", **full_metrics(test_labels, probs_unweighted_tuned)},\n",
+    "]\n",
+    "\n",
+    "existing = pd.read_csv(\"phase4_results_final.csv\")\n",
+    "for name in [\"GraphSAGE (baseline)\", \"XGBoost (structure-free baseline)\", \"GCN (baseline)\",\n",
+    "             \"GATv2 (PAE-weighted, tuned)\", \"GATv2 (PAE-weighted, original)\"]:\n",
+    "    row = existing[existing[\"model\"] == name]\n",
+    "    if len(row):\n",
+    "        r = row.iloc[0].to_dict()\n",
+    "        r[\"model\"] = r[\"model\"] + \" [existing, unchanged]\"\n",
+    "        new_rows.append(r)\n",
+    "\n",
+    "# Also pull in the min-max transform's tuned result for a 3-way comparison, if that experiment has been run\n",
+    "minmax_results_path = os.path.join(\"pae_minmax_experiment\", \"results_comparison.csv\")\n",
+    "if os.path.exists(minmax_results_path):\n",
+    "    minmax_existing = pd.read_csv(minmax_results_path)\n",
+    "    row = minmax_existing[minmax_existing[\"model\"] == \"GATv2 (min-max PAE, tuned)\"]\n",
+    "    if len(row):\n",
+    "        r = row.iloc[0].to_dict()\n",
+    "        r[\"model\"] = r[\"model\"] + \" [existing, unchanged]\"\n",
+    "        new_rows.append(r)\n",
+    "\n",
+    "results_comparison_df = pd.DataFrame(new_rows).sort_values(\"AUPRC\", ascending=False)\n",
+    "results_comparison_df.to_csv(os.path.join(EXPERIMENT_DIR, \"results_comparison.csv\"), index=False)\n",
+    "print(results_comparison_df.to_string(index=False))\n",
+))
+
+# ── Section 11: significance tests ────────────────────────────────────────────
+cells.append(md(
+    "## 11. Statistical Significance Testing\n",
+    "Identical methodology to Phase 4 and the min-max experiment.\n",
+))
+cells.append(code(
+    "def compute_midrank(x):\n",
+    "    J = np.argsort(x); Z = x[J]; N = len(x)\n",
+    "    T = np.zeros(N, dtype=float)\n",
+    "    i = 0\n",
+    "    while i < N:\n",
+    "        j = i\n",
+    "        while j < N and Z[j] == Z[i]:\n",
+    "            j += 1\n",
+    "        T[i:j] = 0.5 * (i + j - 1) + 1\n",
+    "        i = j\n",
+    "    T2 = np.empty(N, dtype=float); T2[J] = T\n",
+    "    return T2\n",
+    "\n",
+    "\n",
+    "def delong_test(probs_a, probs_b, labels):\n",
+    "    labels = np.asarray(labels)\n",
+    "    order = np.argsort(-labels)\n",
+    "    m = int(np.sum(labels == 1)); n = int(np.sum(labels == 0))\n",
+    "    preds_list = [np.asarray(probs_a), np.asarray(probs_b)]\n",
+    "    k = len(preds_list)\n",
+    "    tx = np.empty([k, m]); ty = np.empty([k, n]); tz = np.empty([k, m + n])\n",
+    "    for r in range(k):\n",
+    "        preds_ordered = preds_list[r][order]\n",
+    "        tx[r, :] = compute_midrank(preds_ordered[:m])\n",
+    "        ty[r, :] = compute_midrank(preds_ordered[m:])\n",
+    "        tz[r, :] = compute_midrank(preds_ordered)\n",
+    "    aucs = tz[:, :m].sum(axis=1) / m / n - float(m + 1.0) / 2.0 / n\n",
+    "    v01 = (tz[:, :m] - tx[:, :]) / n\n",
+    "    v10 = 1.0 - (tz[:, m:] - ty[:, :]) / m\n",
+    "    delongcov = np.cov(v01) / m + np.cov(v10) / n\n",
+    "    assert abs(aucs[0] - roc_auc_score(labels, probs_a)) < 1e-6\n",
+    "    assert abs(aucs[1] - roc_auc_score(labels, probs_b)) < 1e-6\n",
+    "    l = np.array([1, -1])\n",
+    "    z = l.dot(aucs) / np.sqrt(l.dot(delongcov).dot(l))\n",
+    "    p = 2 * (1 - stats.norm.cdf(abs(z)))\n",
+    "    return {\"auc_a\": aucs[0], \"auc_b\": aucs[1], \"z\": z, \"p_value\": p}\n",
+    "\n",
+    "\n",
+    "def paired_bootstrap_auprc(probs_a, probs_b, labels, n_boot=2000, seed=0):\n",
+    "    rng_b = np.random.RandomState(seed)\n",
+    "    labels = np.asarray(labels); probs_a = np.asarray(probs_a); probs_b = np.asarray(probs_b)\n",
+    "    n_test = len(labels)\n",
+    "    diffs = np.empty(n_boot)\n",
+    "    for i in range(n_boot):\n",
+    "        idx = rng_b.randint(0, n_test, n_test)\n",
+    "        diffs[i] = (average_precision_score(labels[idx], probs_a[idx])\n",
+    "                    - average_precision_score(labels[idx], probs_b[idx]))\n",
+    "    ci_low, ci_high = np.percentile(diffs, [2.5, 97.5])\n",
+    "    p_value = 2 * min((diffs > 0).mean(), (diffs < 0).mean())\n",
+    "    return {\"mean_diff\": diffs.mean(), \"ci_low\": ci_low, \"ci_high\": ci_high, \"p_value\": p_value}\n",
+    "\n",
+    "\n",
+    "def mcnemar_test(probs_a, probs_b, labels, threshold=0.5):\n",
+    "    preds_a = (np.asarray(probs_a) >= threshold).astype(int)\n",
+    "    preds_b = (np.asarray(probs_b) >= threshold).astype(int)\n",
+    "    correct_a = preds_a == labels; correct_b = preds_b == labels\n",
+    "    table = [[int(np.sum(correct_a & correct_b)), int(np.sum(correct_a & ~correct_b))],\n",
+    "             [int(np.sum(~correct_a & correct_b)), int(np.sum(~correct_a & ~correct_b))]]\n",
+    "    result = mcnemar(table, exact=False, correction=True)\n",
+    "    return {\"statistic\": result.statistic, \"p_value\": result.pvalue}\n",
+    "\n",
+    "\n",
+    "def run_all_significance_tests(name_a, probs_a, name_b, probs_b, labels):\n",
+    "    mc = mcnemar_test(probs_a, probs_b, labels)\n",
+    "    bs = paired_bootstrap_auprc(probs_a, probs_b, labels)\n",
+    "    dl = delong_test(probs_a, probs_b, labels)\n",
+    "    significant = bs[\"p_value\"] < 0.05 or dl[\"p_value\"] < 0.05\n",
+    "    print(f\"\\n=== {name_a}  vs.  {name_b} ===\")\n",
+    "    print(f\"McNemar p={mc['p_value']:.4f} | Bootstrap AUPRC diff={bs['mean_diff']:+.4f} \"\n",
+    "          f\"(p={bs['p_value']:.4f}) | DeLong AUROC p={dl['p_value']:.4f} \"\n",
+    "          f\"-> {'SIGNIFICANT' if significant else 'not significant'}\")\n",
+    "    return {\"comparison\": f\"{name_a} vs {name_b}\", \"mcnemar_p\": mc[\"p_value\"],\n",
+    "            \"bootstrap_auprc_diff\": bs[\"mean_diff\"], \"bootstrap_ci_low\": bs[\"ci_low\"],\n",
+    "            \"bootstrap_ci_high\": bs[\"ci_high\"], \"bootstrap_p\": bs[\"p_value\"],\n",
+    "            \"delong_z\": dl[\"z\"], \"delong_p\": dl[\"p_value\"], \"significant\": significant}\n",
+    "\n",
+    "\n",
+    "sig_rows = []\n",
+    "sig_rows.append(run_all_significance_tests(\n",
+    "    \"GATv2 (directional PAE, default)\", probs_directional_default,\n",
+    "    \"GATv2 (unweighted, default)\", probs_unweighted_default, test_labels))\n",
+    "sig_rows.append(run_all_significance_tests(\n",
+    "    \"GATv2 (directional PAE, tuned)\", probs_directional_tuned,\n",
+    "    \"GATv2 (unweighted, tuned)\", probs_unweighted_tuned, test_labels))\n",
+    "sig_rows.append(run_all_significance_tests(\n",
+    "    \"GATv2 (directional PAE, tuned)\", probs_directional_tuned,\n",
+    "    \"GATv2 (old transform 1/(1+PAE), tuned)\", test_df[\"old_transform_tuned_prob\"].values, test_labels))\n",
+    "sig_rows.append(run_all_significance_tests(\n",
+    "    \"GATv2 (directional PAE, tuned)\", probs_directional_tuned,\n",
+    "    \"GraphSAGE (baseline)\", test_df[\"graphsage_prob\"].values, test_labels))\n",
+    "sig_rows.append(run_all_significance_tests(\n",
+    "    \"GATv2 (directional PAE, default)\", probs_directional_default,\n",
+    "    \"GATv2 (directional PAE, tuned)\", probs_directional_tuned, test_labels))\n",
+    "\n",
+    "pd.DataFrame(sig_rows).to_csv(os.path.join(EXPERIMENT_DIR, \"significance_tests.csv\"), index=False)\n",
+    "print(\"\\nSaved significance_tests.csv\")\n",
+))
+
+# ── Section 12: PAE value quantification ──────────────────────────────────────
+cells.append(md(
+    "## 12. PAE Value Quantification (Proposal-Required Deliverable, This Variant)\n",
+))
+cells.append(code(
+    "def pct_row(stage, pae_probs, unweighted_probs, labels, sig_row):\n",
+    "    pae_auprc = average_precision_score(labels, pae_probs)\n",
+    "    uw_auprc = average_precision_score(labels, unweighted_probs)\n",
+    "    pct = (pae_auprc - uw_auprc) / uw_auprc * 100\n",
+    "    return {\"Stage\": stage, \"PAE-weighted AUPRC\": round(pae_auprc, 4),\n",
+    "            \"Unweighted AUPRC\": round(uw_auprc, 4), \"% change (PAE vs unweighted)\": round(pct, 3),\n",
+    "            \"bootstrap_p\": round(sig_row[\"bootstrap_p\"], 4), \"delong_p\": round(sig_row[\"delong_p\"], 4),\n",
+    "            \"significant (alpha=0.05)\": bool(sig_row[\"significant\"])}\n",
+    "\n",
+    "\n",
+    "pae_quant_rows = [\n",
+    "    pct_row(\"Default (untuned)\", probs_directional_default, probs_unweighted_default, test_labels, sig_rows[0]),\n",
+    "    pct_row(\"Tuned (B_reg_small)\", probs_directional_tuned, probs_unweighted_tuned, test_labels, sig_rows[1]),\n",
+    "]\n",
+    "pae_quant_df = pd.DataFrame(pae_quant_rows)\n",
+    "pae_quant_df.to_csv(os.path.join(EXPERIMENT_DIR, \"pae_value_quantification_directional.csv\"), index=False)\n",
+    "print(pae_quant_df.to_string(index=False))\n",
+))
+
+# ── Section 13: AlphaMissense comparison ──────────────────────────────────────
+cells.append(md(
+    "## 13. AlphaMissense Head-to-Head Comparison\n",
+))
+cells.append(code(
+    "AA3TO1 = {\n",
+    "    \"Ala\": \"A\", \"Arg\": \"R\", \"Asn\": \"N\", \"Asp\": \"D\", \"Cys\": \"C\",\n",
+    "    \"Gln\": \"Q\", \"Glu\": \"E\", \"Gly\": \"G\", \"His\": \"H\", \"Ile\": \"I\",\n",
+    "    \"Leu\": \"L\", \"Lys\": \"K\", \"Met\": \"M\", \"Phe\": \"F\", \"Pro\": \"P\",\n",
+    "    \"Ser\": \"S\", \"Thr\": \"T\", \"Trp\": \"W\", \"Tyr\": \"Y\", \"Val\": \"V\",\n",
+    "}\n",
+    "test_df[\"ref_1\"] = test_df[\"Ref_AA\"].map(AA3TO1)\n",
+    "test_df[\"variant_key\"] = test_df[\"ref_1\"] + test_df[\"Pos\"].astype(str) + test_df[\"Alt_AA_1\"]\n",
+    "\n",
+    "am_scores = pd.read_csv(AM_CACHE_PATH)\n",
+    "am_clean = am_scores.rename(columns={\"uniprot_id\": \"UniProt_ID\", \"protein_variant\": \"variant_key\"})[\n",
+    "    [\"UniProt_ID\", \"variant_key\", \"am_pathogenicity\", \"am_class\"]]\n",
+    "\n",
+    "merged = test_df.merge(am_clean, on=[\"UniProt_ID\", \"variant_key\"], how=\"inner\")\n",
+    "coverage = len(merged) / len(test_df) * 100\n",
+    "print(f\"Coverage: {len(merged):,} / {len(test_df):,} test variants matched ({coverage:.1f}%)\")\n",
+    "\n",
+    "AM_THRESHOLD = 0.564\n",
+    "am_labels = merged[\"true_label\"].values.astype(int)\n",
+    "\n",
+    "def metrics_row(name, probs, labels, threshold=0.5):\n",
+    "    m = full_metrics(labels, probs, threshold)\n",
+    "    m[\"Model\"] = name\n",
+    "    m[\"Threshold\"] = threshold\n",
+    "    return m\n",
+    "\n",
+    "am_results = [\n",
+    "    metrics_row(\"GATv2 (directional PAE, tuned)\", merged[\"directional_tuned_prob\"].values, am_labels, 0.5),\n",
+    "    metrics_row(\"GraphSAGE (baseline)\", merged[\"graphsage_prob\"].values, am_labels, 0.5),\n",
+    "    metrics_row(\"AlphaMissense\", merged[\"am_pathogenicity\"].values, am_labels, AM_THRESHOLD),\n",
+    "]\n",
+    "am_results_df = pd.DataFrame(am_results)[[\"Model\", \"AUPRC\", \"AUROC\", \"Accuracy\", \"Precision\", \"Recall\", \"F1\", \"Threshold\"]]\n",
+    "am_results_df = am_results_df.sort_values(\"AUPRC\", ascending=False)\n",
+    "am_results_df.to_csv(os.path.join(EXPERIMENT_DIR, \"alphamissense_comparison_results.csv\"), index=False)\n",
+    "print(am_results_df.to_string(index=False))\n",
+    "\n",
+    "am_sig_rows = []\n",
+    "am_sig_rows.append(run_all_significance_tests(\n",
+    "    \"GATv2 (directional PAE, tuned)\", merged[\"directional_tuned_prob\"].values,\n",
+    "    \"AlphaMissense\", merged[\"am_pathogenicity\"].values, am_labels))\n",
+    "am_sig_rows.append(run_all_significance_tests(\n",
+    "    \"GATv2 (directional PAE, tuned)\", merged[\"directional_tuned_prob\"].values,\n",
+    "    \"GraphSAGE (baseline)\", merged[\"graphsage_prob\"].values, am_labels))\n",
+    "pd.DataFrame(am_sig_rows).to_csv(os.path.join(EXPERIMENT_DIR, \"alphamissense_significance_tests.csv\"), index=False)\n",
+    "\n",
+    "fig, axes = plt.subplots(1, 2, figsize=(12, 5))\n",
+    "names = [\"GATv2\\n(directional PAE,\\ntuned)\", \"GraphSAGE\\n(baseline)\", \"AlphaMissense\"]\n",
+    "colors = [\"#2E6F8E\", \"#4CAF50\", \"#FF5722\"]\n",
+    "for ax, metric in zip(axes, [\"AUPRC\", \"AUROC\"]):\n",
+    "    vals = [am_results_df.set_index(\"Model\").loc[n, metric] for n in\n",
+    "            [\"GATv2 (directional PAE, tuned)\", \"GraphSAGE (baseline)\", \"AlphaMissense\"]]\n",
+    "    bars = ax.bar(names, vals, color=colors, width=0.5, edgecolor=\"white\")\n",
+    "    ax.set_ylim(min(vals) - 0.02, max(vals) + 0.03)\n",
+    "    ax.set_ylabel(metric)\n",
+    "    ax.set_title(f\"{metric} - matched subset (n={len(merged):,})\")\n",
+    "    for bar, val in zip(bars, vals):\n",
+    "        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.001, f\"{val:.4f}\",\n",
+    "                ha=\"center\", va=\"bottom\", fontsize=9)\n",
+    "plt.suptitle(\"Directional PAE features vs. GraphSAGE vs. AlphaMissense\", fontsize=12)\n",
+    "plt.tight_layout()\n",
+    "fig.savefig(os.path.join(NEW_FIGURES_DIR, \"alphamissense_comparison_directional.png\"), dpi=200, bbox_inches=\"tight\")\n",
+    "plt.show()\n",
+    "plt.close(fig)\n",
+))
+
+# ── Section 14: final summary ─────────────────────────────────────────────────
+cells.append(md(
+    "## 14. Final Summary\n",
+))
+cells.append(code(
+    "print(\"=\"*70)\n",
+    "print(\"SUMMARY: Directional PAE Edge Features vs. Original Symmetrized 1/(1+PAE)\")\n",
+    "print(\"=\"*70)\n",
+    "print(f\"\\nModel comparison (full table in results_comparison.csv):\")\n",
+    "print(results_comparison_df[[\"model\", \"AUPRC\", \"AUROC\", \"Accuracy\"]].to_string(index=False))\n",
+    "print(f\"\\nPAE Value Quantification (full table in pae_value_quantification_directional.csv):\")\n",
+    "print(pae_quant_df.to_string(index=False))\n",
+    "print(f\"\\nAlphaMissense comparison (full table in alphamissense_comparison_results.csv):\")\n",
+    "print(am_results_df.to_string(index=False))\n",
+))
+cells.append(md(
+    "### Methods note (copy-paste for the paper's robustness-check / limitations section)\n",
+    "> As a second robustness check, the original PAE-weighting pipeline's directional averaging "
+    "step (`PAE[i][j]` and `PAE[j][i]` collapsed to a single symmetrized scalar) was replaced with "
+    "two separate directional edge features, increasing `edge_dim` from 2 to 3. A diagnostic on a "
+    "300-protein sample showed 32.8% of edges tied under the symmetrized transform were "
+    "distinguishable once directional information was retained, while 67.2% remained genuinely "
+    "tied (AlphaFold reports identical confidence in both directions for those pairs). The GATv2 "
+    "architecture, training procedure, hyperparameter configurations, and train/val/test split "
+    "were kept identical to the main experiment. [Fill in after running: whether recovering this "
+    "directional information changed the PAE-weighted-vs-unweighted comparison's direction or "
+    "significance.]\n",
+))
+
+nb = {
+    "cells": cells,
+    "metadata": {
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {
+            "codemirror_mode": {"name": "ipython", "version": 3},
+            "file_extension": ".py", "mimetype": "text/x-python", "name": "python",
+            "nbconvert_exporter": "python", "pygments_lexer": "ipython3", "version": "3.13.5",
+        },
+    },
+    "nbformat": 4,
+    "nbformat_minor": 5,
+}
+
+with open("experiment_pae_directional_features.ipynb", "w", encoding="utf-8") as f:
+    json.dump(nb, f, indent=1, ensure_ascii=False)
+    f.write("\n")
+
+print(f"Generated experiment_pae_directional_features.ipynb with {len(cells)} cells.")

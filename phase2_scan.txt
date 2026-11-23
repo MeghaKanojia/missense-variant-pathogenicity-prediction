@@ -1,0 +1,45 @@
+--- CELL 6 markdown ---
+## 3. Fetch Official AlphaFold Prediction Metadata
+### Why metadata-driven download, not a hardcoded URL pattern
+A common (and fragile) shortcut is to hardcode the file URL pattern, e.g. `AF-{accession}-F1-model_v4.pdb`. This assumes every entry is on model version `v4` and is a single, unfragmented model â€” neither is guaranteed. Instead we query AlphaFold DB's **official prediction metadata API** (`GET https://alphafold.ebi.ac.uk/api/prediction/{accession}`, documented alongside the AlphaFold DB release, Varadi et al. 2022), which returns the *exact, current* download URLs (`pdbUrl`, `paeDocUrl`) together with the `uniprotSequence` actually used to build that specific model, its UniProt coordinate range (`uniprotStart`, `uniprotEnd`), and the released model version (`latestVersion`). Driving the download from this metadata, rather than from an assumed filename, is the approach the AlphaFold DB documentation itself recommends for programmatic access.
+
+### Why this matters for correctness, not just convenience
+This metadata is also what lets us catch a subtle but important failure mode in Section 6: **UniProt's canonical sequence can be revised after an AlphaFold model was built.*
+
+--- CELL 11 code ---
+def process_protein(uniprot_id):
+    session = requests.Session()
+    metadata, meta_status = fetch_metadata(session, uniprot_id)
+
+    record = {
+        "UniProt_ID": uniprot_id,
+        "meta_status": meta_status,
+        "pdb_status": None,
+        "pae_status": None,
+        "pdb_path": None,
+        "pae_path": None,
+        "uniprot_sequence": None,
+        "uniprot_start": None,
+        "uniprot_end": None,
+        "latest_version": None,
+    }
+
+    if meta_status not in ("success", "cached"):
+        return record
+
+    entry = metadata
+    record["uniprot_sequence"] = entry.get("uniprotSequence")
+    record["uniprot_start"] = entry.get("uniprotStart")
+    record["uniprot_end"] = entry.get("uniprotEnd")
+    record["latest_version"] = entry.get("latestVersion")
+
+    pdb_path = os.path.join(PDB_DIR, f"{uniprot_id}.pdb")
+    pae_path = os.path.join(PAE_DIR, f"{uniprot_id}.json")
+
+    record["pdb_status"] = download_one(session, entry["pdbUrl"], pdb_path)
+    record["pae_status"] = download_one(session, entry["paeDocUrl"], pae_path)
+
+    if record["pdb_status"] in ("success", "already_exists"):
+        record["pdb_path"] = pdb_path
+    if record["pae_status"] in ("success", "alr
+

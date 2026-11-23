@@ -1,0 +1,126 @@
+--- CELL 0 markdown ---
+# Phase 4: Model Training — PAE-Weighted GATv2 vs. Baselines
+This notebook trains the project's core model — a Graph Attention Network (GATv2) whose edges are weighted by AlphaFold's Predicted Aligned Error — and compares it against four baselines to test whether each piece of the architecture is actually earning its place.
+
+**Inputs:** `clinvar_graph_ready.csv`, `protein_graphs/*.pt` (Phase 3)
+
+**Models trained:**
+1. **GATv2 (PAE-weighted)** — the project's proposed model; edge attention is conditioned on `[distance, PAE-confidence]`.
+2. **GATv2 (unweighted ablation)** — identical architecture, but edge features are withheld, so it only sees binary contact structure (the gMVP-style baseline this project is positioned against).
+3. **GCN (plain baseline)** — a simpler, non-attention graph convolution, also unweighted.
+4. **GraphSAGE (additional baseline)** — a different, widely-used non-attention GNN (mean-aggregation over neighbors), broadening architecture coverage beyond a single comparison point.
+5. **XGBoost (flat, structure-free baseline)** — sees only the variant's own ESM-2 embedding and amino-acid identities, with no graph/structure at all.
+
+Comparing all five answers two separate questions: *does structure help at all* (GNNs vs. XGBoost), and *does PAE-weighting help beyond structure alone* (model 1 vs. models 2-4) — which is this project's specific claim.
+
+**Before running:** restart the kernel and close other heavy applications first. We measured a real, one-time host-RAM spike (~5-6 GB, separate from GPU memory) tied to the first model's training in this environment - not a leak (it partially releases afterward), but worth having headroom for given this machine's 15.8 GB total RAM. We also measured **one full training epoch at ~31 minutes** on this GPU (RTX 4050, 6.4 GB) over the full 34,732-variant training split - this notebook is compute-heavy by design (hyperparameter search + a final tuned run + 3-fold cross-validation on top of the initial comparis
+
+--- CELL 10 markdown ---
+## 5. Model Architecture
+### The GATv2 layer and PAE-weighting
+`GATv2Conv` (Brody et al., 2022) accepts an `edge_dim` argument, letting each edge's feature vector — here, `[Cα distance, PAE-derived confidence]` from Phase 3 — directly influence the attention score the model learns for that edge.
+
+### Reading out a *variant* prediction from a *protein-wide* graph
+Each graph covers the whole protein, but we only need one prediction: is *this specific substitution* pathogenic? After message passing, we read out the embedding of only the mutated residue's node and feed that single vector into a small classifier head — rather than pooling over the entire graph, which would dilute the variant's local signal across a (sometimes 1,000+ residue) protein.
+
+**Implementation note (validated empirically before use):** PyTorch Geometric batches multiple variable-sized graphs into one combined graph, offsetting node indices per graph (`batch.ptr`). We recover each graph's mutated-residue embedding via `batch.ptr[:-1] + variant_node_idx`, confirmed to produce *bit-for-bit identical* output to running each graph through the model one at a time.
+
+### Where the model classes actually live
+`GATv2Classifier`, `GCNClassifier`, and `GraphSAGEClassifier` are defined in `models.py`, not pasted into this notebook, so a saved checkpoint can be reloaded later by importing the exact same class definition used during training.
+
+### The ablation and baselines
+- **GATv2 (unweighted)**: identical code, `edge_dim=None` — isolates the effect of PAE-weighting specifically.
+- **GCN**: a non-attention convolution baseline — tests whether attention itself matters.
+- **GraphSAGE**: a second, architecturally different non-attention baseline (mean-aggregation over sampled neighbors, Hamilton et al., 2017) — broadens the comparison beyond a single non-attention architecture, so a GATv2 win (or loss) isn't an artifact of comparing against only one alternative.
+- **XGBoost (Section 7)**: no graph at all — test
+
+--- CELL 19 markdown ---
+### XGBoost (Structure-Free Baseline)
+This baseline sees **no graph at all** — only the mutated residue's own ESM-2 embedding, its wild-type identity, and its substituted identity. If the GNN models substantially outperform this baseline, that is direct evidence that 3D structural context adds real predictive value beyond sequence/identity features alone.
+
+--- CELL 21 code ---
+import xgboost as xgb
+
+xgb_model = xgb.XGBClassifier(
+    n_estimators=300, max_depth=5, learning_rate=0.05,
+    scale_pos_weight=pos_weight_value, eval_metric="logloss", early_stopping_rounds=20, random_state=42,
+)
+xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+xgb_val_probs = xgb_model.predict_proba(X_val)[:, 1]
+xgb_test_probs = xgb_model.predict_proba(X_test)[:, 1]
+print("XGBoost val :", full_metrics(y_val, xgb_val_probs))
+print("XGBoost test:", full_metrics(y_test, xgb_test_probs))
+
+--- CELL 23 code ---
+test_labels_pae, test_probs_pae = evaluate_gnn(model_pae, test_loader)
+test_labels_unw, test_probs_unw = evaluate_gnn(model_unweighted, test_loader)
+test_labels_gcn, test_probs_gcn = evaluate_gnn(model_gcn, test_loader)
+test_labels_sage, test_probs_sage = evaluate_gnn(model_sage, test_loader)
+# all loaders iterate test_ds in the same fixed (non-shuffled) order, so labels align across models
+assert (np.array_equal(test_labels_pae, test_labels_unw) and np.array_equal(test_labels_pae, test_labels_gcn)
+        and np.array_equal(test_labels_pae, test_labels_sage))
+
+initial_results = []
+for name, probs in [("GATv2 (PAE-weighted)", test_probs_pae),
+                     ("GATv2 (unweighted ablation)", test_probs_unw),
+                     ("GCN (baseline)", test_probs_gcn),
+                     ("GraphSAGE (baseline)", test_probs_sage),
+                     ("XGBoost (structure-free baseline)", xgb_test_probs)]:
+    initial_results.append({"model": name, **full_metrics(test_labels_pae, probs)})
+
+initial_results_df = pd.DataFrame(initial_results).sort_values("AUPRC", ascending=False)
+initial_results_df.to_csv("phase4_results_initial.csv", index=False)
+print(initial_results_df.to_string(index=False))
+
+--- CELL 26 code ---
+significance_results = []
+significance_results.append(run_all_significance_tests(
+    "GATv2 (PAE-weighted)", test_probs_pae, "GATv2 (unweighted ablation)", test_probs_unw, test_labels_pae))
+significance_results.append(run_all_significance_tests(
+    "GATv2 (PAE-weighted)", test_probs_pae, "GraphSAGE (baseline)", test_probs_sage, test_labels_pae))
+significance_results.append(run_all_significance_tests(
+    "GATv2 (PAE-weighted)", test_probs_pae, "XGBoost (structure-free baseline)", xgb_test_probs, test_labels_pae))
+significance_results.append(run_all_significance_tests(
+    "GATv2 (unweighted ablation)", test_probs_unw, "XGBoost (structure-free baseline)", xgb_test_probs, test_labels_pae))
+
+pd.DataFrame(significance_results).to_csv("phase4_significance_tests_initial.csv", index=False)
+print("\nSaved phase4_significance_tests_initial.csv")
+
+--- CELL 33 code ---
+test_labels_pae_final, test_probs_pae_final = evaluate_gnn(model_pae_final, test_loader)
+test_labels_unw_final, test_probs_unw_final = evaluate_gnn(model_unw_final, test_loader)
+assert np.array_equal(test_labels_pae_final, test_labels_pae)
+
+final_results = [r for r in initial_results if r["model"] in
+                  ("GCN (baseline)", "GraphSAGE (baseline)", "XGBoost (structure-free baseline)")]
+final_results.append({"model": "GATv2 (PAE-weighted, tuned)", **full_metrics(test_labels_pae, test_probs_pae_final)})
+final_results.append({"model": "GATv2 (unweighted, tuned)", **full_metrics(test_labels_pae, test_probs_unw_final)})
+final_results.append({"model": "GATv2 (PAE-weighted, original)", **full_metrics(test_labels_pae, test_probs_pae)})
+final_results.append({"model": "GATv2 (unweighted, original)", **full_metrics(test_labels_pae, test_probs_unw)})
+
+final_results_df = pd.DataFrame(final_results).sort_values("AUPRC", ascending=False)
+final_results_df.to_csv("phase4_results_final.csv", index=False)
+print(final_results_df.to_string(index=False))
+
+--- CELL 35 code ---
+significance_results_final = []
+significance_results_final.append(run_all_significance_tests(
+    "GATv2 (PAE-weighted, tuned)", test_probs_pae_final,
+    "GATv2 (unweighted, tuned)", test_probs_unw_final, test_labels_pae))
+significance_results_final.append(run_all_significance_tests(
+    "GATv2 (PAE-weighted, tuned)", test_probs_pae_final,
+    "GraphSAGE (baseline)", test_probs_sage, test_labels_pae))
+significance_results_final.append(run_all_significance_tests(
+    "GATv2 (PAE-weighted, tuned)", test_probs_pae_final,
+    "XGBoost (structure-free baseline)", xgb_test_probs, test_labels_pae))
+significance_results_final.append(run_all_significance_tests(
+    "GATv2 (PAE-weighted, original)", test_probs_pae,
+    "GATv2 (PAE-weighted, tuned)", test_probs_pae_final, test_labels_pae))
+
+pd.DataFrame(significance_results_final).to_csv("phase4_significance_tests_final.csv", index=False)
+print("\nSaved phase4_significance_tests_final.csv")
+
+--- CELL 45 markdown ---
+## 17. Methods Summary (Copy-Paste for the Paper)
+> Proteins were split into training, validation, and test sets (70/15/15) at the protein level (by UniProt accession) to prevent data leakage between variants sharing the same structural graph; disjointness was verified programmatically. Batches were constructed using a node-budget sampler bounding total residue count per batch rather than a fixed number of graphs, keeping peak GPU memory bounded given the wide range of protein sizes (up to 2,699 residues). The proposed model was a two-layer GATv2 (Brody et al., 2022) in which edge attention was conditioned on AlphaFold's Cα distance and Predicted Aligned Error (PAE) between residue pairs; the mutated residue's post-message-passing embedding was extracted and passed to an MLP classifier rather than pooling over the full graph. Class imbalance was addressed via a positive-class weight in the loss. Four baselines isolated each architectural choice: an identical GATv2 with edge features withheld (testing PAE-weighting specifically), a GCN and a GraphSAGE model (Hamilton et al., 2017) testing the contribution of attention against two architecturally distinct non-attention alternatives, and an XGBoost classifier on the variant residue's ESM-2 embedding and amino-acid identity alone with no structural graph (testing structure itself). An initial training pass showed all models within ~0.01-0.02 AUPRC of one another, with the GNNs overfitting within 1-3 epochs. This was addressed with a constrained hyperparameter search (6 configurations spanning learning rate, dropout, hidden dimensionality, and weight decay, each evaluated over a short 5-epoch budget given the observed early overfitting) for the PAE-weighted model, with the winning configuration then applied identically to its unweighted ablation and both retrained to full convergence with early stopping. Pairwise model comparisons were evaluated for statistical significance using three paired tests on the held-out test s
+
